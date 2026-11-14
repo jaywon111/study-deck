@@ -1,0 +1,18 @@
+:root{--bg:#0f172a;--card:#1e293b;--fg:#e2e8f0;--mut:#94a3b8;--acc:#6366f1;--ok:#22c55e;--bad:#ef4444}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif;padding-bottom:76px}
+header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;position:sticky;top:0;background:var(--bg);z-index:5}
+h1{margin:0;font-size:20px}h2{font-size:17px;margin:18px 0 8px}main{padding:0 16px 16px;max-width:720px;margin:auto}
+.badge{font-size:12px;padding:3px 8px;border-radius:99px;background:var(--card);color:var(--mut)}.badge.on{color:var(--ok)}
+nav{position:fixed;bottom:0;left:0;right:0;display:flex;background:#0b1220;border-top:1px solid #243049;padding-bottom:env(safe-area-inset-bottom)}
+nav button{flex:1;background:none;border:0;color:var(--mut);padding:12px 2px;font-size:12px}nav button.on{color:#fff;border-top:2px solid var(--acc)}
+.card{background:var(--card);border-radius:12px;padding:12px;margin:10px 0}
+input,select,textarea{width:100%;background:#0b1220;color:var(--fg);border:1px solid #334155;border-radius:8px;padding:10px;font:inherit;margin:4px 0}
+button.b{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 14px;font:inherit;margin:4px 4px 4px 0}
+button.b.alt{background:#334155}button.b.bad{background:var(--bad)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row>*{flex:1}.mut{color:var(--mut);font-size:14px}
+.blk{display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid #2a3750}.blk input{width:22px;height:22px;flex:none}
+.blk.done .t{text-decoration:line-through;opacity:.5}.tag{font-size:11px;padding:2px 6px;border-radius:6px;background:#334155;margin-right:6px}
+.tag.learn{background:#4338ca}.tag.practice{background:#0e7490}.tag.review{background:#b45309}.tag.test{background:#be123c}
+.opt{display:block;width:100%;text-align:left;background:#0b1220;color:var(--fg);border:1px solid #334155;border-radius:8px;padding:10px;margin:6px 0;font:inherit}
+.opt.ok{border-color:var(--ok)}.opt.no{border-color:var(--bad)}.warn{color:#fbbf24;font-size:14px}.days label{display:inline-flex;gap:3px;align-items:center;margin-right:8px;font-size:14px}.days input{width:auto}
+.bar{height:8px;background:#0b1220;border-radius:9px;overflow:hidden}.bar i{display:block;height:100%;background:var(--ok)}
