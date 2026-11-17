@@ -1,10 +1,12 @@
-import { uid, BLOCK, dstr, parseD, splitSections, makeCards, makeQuiz, gradeCard, dueCards, topicStats, buildPlan, searchSections, validateImport } from "/lib.js";
+import { uid, BLOCK, dstr, parseD, splitSections, makeCards, makeQuiz, gradeCard, dueCards, topicStats, buildPlan, searchSections, validateImport, makeClozeCards, makeQuizFromNotes, editCard, deleteCard, dueQueue, queueStats, sourceLabel, rescheduleMissed, backupStatus, BACKUP_VERSION, docSearch } from "/lib.js";
 
 // ---------- IndexedDB ----------
-const STORES = ["kv", "docs", "cards", "attempts"];
+const STORES = ["kv", "docs", "cards", "attempts", "sessions", "marks"];
 const dbp = new Promise((res, rej) => {
-  const r = indexedDB.open("study-deck", 1);
-  r.onupgradeneeded = () => { for (const s of STORES) r.result.createObjectStore(s, { keyPath: s === "kv" ? "k" : "id" }); };
+  const r = indexedDB.open("study-deck", 3);
+  r.onupgradeneeded = () => {
+    for (const s of STORES) if (!r.result.objectStoreNames.contains(s)) r.result.createObjectStore(s, { keyPath: s === "kv" ? "k" : "id" });
+  };
   r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
 });
 const tx = async (s, mode, fn) => { const db = await dbp; return new Promise((res, rej) => { const t = db.transaction(s, mode); const out = fn(t.objectStore(s)); t.oncomplete = () => res(out && out.result !== undefined ? out.result : out); t.onerror = () => rej(t.error); }); };
@@ -13,8 +15,9 @@ const put = (s, v) => tx(s, "readwrite", (o) => o.put(v));
 const del = (s, id) => tx(s, "readwrite", (o) => o.delete(id));
 const clear = (s) => tx(s, "readwrite", (o) => o.clear());
 
-const DEF = { subjects: [], dailyMinutes: 90, winStart: "16:00", winEnd: "21:00", busy: [], weak: {}, done: {} };
-let st = { ...DEF }, docs = [], cards = [], attempts = [], plan = null, tab = "today", ai = { ready: false };
+const DEF = { subjects: [], dailyMinutes: 90, winStart: "16:00", winEnd: "21:00", busy: [], weak: {}, done: {}, lastExportAt: 0, lastImportAt: 0, snapAt: 0 };
+let st = { ...DEF }, docs = [], cards = [], attempts = [], sessions = [], marks = [], plan = null, tab = "today", ai = { ready: false };
+let carried = [], carriedDone = {}, sess = null, sessTimer = 0, guideSel = null;
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const saveSt = () => put("kv", { k: "state", v: st });
@@ -22,12 +25,18 @@ const subName = (id) => (st.subjects.find((s) => s.id === id) || {}).name || "?"
 const secsBySub = () => { const m = {}; for (const d of docs) (m[d.subjectId] ||= []).push(...d.sections); return m; };
 const allSecs = () => docs.flatMap((d) => d.sections.map((s) => ({ ...s, subjectId: d.subjectId })));
 const secById = (id) => allSecs().find((s) => s.id === id);
-const replan = () => { plan = buildPlan(st, secsBySub(), new Date(), st.done); };
+const replan = () => {
+  plan = buildPlan(st, secsBySub(), new Date(), st.done);
+  carried = rescheduleMissed(plan.days, st.done, st, new Date());
+};
+const b64 = async (blob) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.readAsDataURL(blob); });
+const blobFromB64 = (b64s, type) => Uint8Array.from(atob(b64s), (c) => c.charCodeAt(0));
 
 async function load() {
   const kv = (await all("kv")).find((x) => x.k === "state");
   st = { ...DEF, ...(kv ? kv.v : {}) };
   docs = await all("docs"); cards = await all("cards"); attempts = await all("attempts");
+  try { sessions = await all("sessions"); } catch {} try { marks = await all("marks"); } catch {}
   replan();
 }
 
@@ -44,7 +53,7 @@ async function checkAI() {
 }
 
 // ---------- views ----------
-const TABS = [["today", "Today", "🏠", "Home"], ["plan", "Plan", "🗓️", "Plan"], ["library", "Library", "📚", "Library"], ["cards", "Cards", "🃏", "Cards"], ["quiz", "Quiz", "🧪", "Quiz"], ["ask", "Ask", "💬", "Ask"], ["progress", "Progress", "📈", "Progress"], ["setup", "Setup", "⚙️", "Setup"]];
+const TABS = [["today", "Today", "🏠", "Home"], ["plan", "Plan", "🗓️", "Plan"], ["session", "Focus", "⏱️", "Focus session"], ["cards", "Cards", "🃏", "Cards"], ["quiz", "Quiz", "🧪", "Quiz"], ["library", "Library", "📚", "Library"], ["ask", "Ask", "💬", "Ask"], ["progress", "Progress", "📈", "Progress"], ["setup", "Setup", "⚙️", "Setup"]];
 
 // The entire nav strip is a 3D rotatable carousel. Each tab is a card
 // on a cylinder; drag to spin, tap a front card to go there.
@@ -340,6 +349,40 @@ function bindChecks(root) {
   root.querySelectorAll("input[data-b]").forEach((c) => c.onchange = async () => { st.done[c.dataset.b] = c.checked; if (!c.checked) delete st.done[c.dataset.b]; await saveSt(); replan(); render(); });
 }
 const dayHTML = (d) => d.blocks.length ? sectionsOf(d.blocks).map(([p, bl]) => `<h2>${p}</h2><div class="card">${bl.map(blockHTML).join("")}<div class="mut">5 min break after each block</div></div>`).join("") : `<div class="card mut">Nothing scheduled${d.free ? "" : " (no free time in your window)"}.</div>`;
+const carriedHTML = () => {
+  const open = carried.filter((b) => !b.unscheduled && !carriedDone[b.id]);
+  const stuck = carried.filter((b) => b.unscheduled);
+  return `<section><h2>Carried over (missed blocks)</h2>${open.length ? `<div class="card" style="display:grid;gap:8px">${open.map((b) => `<div class="row"><label class="blk ${carriedDone[b.id] ? "done" : ""}" style="flex:1"><input type="checkbox" data-carried="${b.id}" ${carriedDone[b.id] ? "checked" : ""}><div class="t"><span class="tag ${b.type}">${b.type}</span>${esc(b.subject)}: ${esc(b.label)}<div class="mut">${parseD(b.date).toDateString()} ${b.start} to ${b.end}</div></div></label><button class="b alt" data-focus="${b.id}">Focus</button></div>`).join("")}</div>` : ""}${stuck.length ? `<div class="warn">${stuck.map((b) => `${esc(b.subject)}: ${esc(b.label)}`).join("<br>")}</div>` : ""}${!open.length && !stuck.length ? `<div class="card mut">Nothing missed. Missed blocks land here, rescheduled around your busy times and test dates.</div>` : ""}</section>`;
+};
+function bindCarried(root) {
+  root.querySelectorAll("input[data-carried]").forEach((c) => c.onchange = async () => { carriedDone[c.dataset.carried] = c.checked; if (!c.checked) delete carriedDone[c.dataset.carried]; st.done[c.dataset.carried] = c.checked; if (!c.checked) delete st.done[c.dataset.carried]; await saveSt(); replan(); render(); });
+  root.querySelectorAll("[data-focus]").forEach((b) => b.onclick = () => { tab = "session"; const blk = carried.find((x) => x.id === b.dataset.focus); startSession(blk ? blk.subjectId : "", blk); render(); });
+}
+const mmss = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+function startSession(subId, block, opts = {}) {
+  const secs = allSecs().filter((s) => !subId || s.subjectId === subId);
+  const due = dueQueue(cards.filter((c) => !subId || c.subjectId === subId)).slice(0, 12);
+  const quizN = Math.max(1, Math.min(10, opts.quizN || 3));
+  const quiz = [...makeQuiz(due.length ? due : cards.filter((c) => !subId || c.subjectId === subId), quizN), ...makeQuizFromNotes(secs, Math.max(0, quizN - 2))].slice(0, quizN);
+  sess = { started: Date.now(), subjectId: subId || null, total: (opts.minutes || 25) * 60, left: (opts.minutes || 25) * 60, minutes: opts.minutes || 25, notes: block ? `${block.label}\n` : "", cards: due, shown: false, quiz, qi: 0, quizRight: 0, done: false, block: block || null };
+  clearInterval(sessTimer);
+  sessTimer = setInterval(() => { if (sess) { sess.left = Math.max(0, sess.left - 1); const t = $("#sestime"); if (t) t.textContent = mmss(sess.left); } }, 1000);
+}
+function drawSession(v) {
+  const c = sess.cards[0];
+  const q = sess.quiz[sess.qi];
+  v.innerHTML = `<div class="card"><div class="row"><b>Focus: ${esc(subName(sess.subjectId))}</b><span id="sestime" style="font-weight:700;font-size:22px">${mmss(sess.left)}</span></div><div class="bar"><i style="width:${sess.total ? Math.round(sess.left / sess.total * 100) : 0}%"></i></div><div class="row"><button class="b alt" id="sepause">${sessTimer ? "Pause" : "Resume"}</button><button class="b" id="seend">Finish session</button></div></div>
+  <div class="card"><h2>Session notes</h2><textarea id="senotes" rows="4" placeholder=" jot what you learned">${esc(sess.notes)}</textarea></div>
+  ${c ? `<div class="card"><div class="mut">${sess.cards.length} cards in this session | ${esc(sourceLabel(c))}</div><h2>${esc(c.q)}</h2>${sess.shown ? `<p>${esc(c.a)}</p><div class="row"><button class="b bad" data-sq="0">Again</button><button class="b alt" data-sq="3">Hard</button><button class="b" data-sq="4">Good</button><button class="b alt" data-sq="5">Easy</button></div>` : `<button class="b" id="seshow">Show answer</button>`}</div>` : `<div class="card mut">No due cards. Quiz below still works from your notes.</div>`}
+  ${q && !c ? `<div class="card"><div class="mut">Quick quiz ${sess.qi + 1}/${sess.quiz.length}</div><h2>${esc(q.q)}</h2>${q.options.map((o, k) => `<button class="opt" data-qk="${k}">${esc(o)}</button>`).join("")}<div id="seex"></div></div>` : ""}
+  ${!c && !q ? `<div class="card"><b>Session complete</b><div class="mut">Cards reviewed, quiz ${sess.quizRight} right.</div></div>` : ""}`;
+  $("#senotes").oninput = (e) => { sess.notes = e.target.value; };
+  $("#sepause").onclick = () => { if (sessTimer) { clearInterval(sessTimer); sessTimer = 0; } else { sessTimer = setInterval(() => { if (sess) { sess.left = Math.max(0, sess.left - 1); const t = $("#sestime"); if (t) t.textContent = mmss(sess.left); } }, 1000); } drawSession(v); };
+  $("#seend").onclick = async () => { clearInterval(sessTimer); const mins = Math.max(1, Math.round((sess.total - sess.left) / 60)); const rec = { id: uid(), subjectId: sess.subjectId, started: sess.started, minutes: mins, cards: sess.cards.length, quizRight: sess.quizRight, quizN: sess.quiz.length, notes: sess.notes }; await put("sessions", rec); sessions.push(rec); if (sess.block && sess.block.id) { st.done[sess.block.id] = true; await saveSt(); } sess = null; replan(); render(); };
+  const sh = $("#seshow"); if (sh) sh.onclick = () => { sess.shown = true; drawSession(v); };
+  v.querySelectorAll("[data-sq]").forEach((b) => b.onclick = async () => { const nd = gradeCard(c, +b.dataset.sq); await put("cards", nd); cards[cards.findIndex((x) => x.id === c.id)] = nd; sess.cards.shift(); sess.shown = false; await saveSt(); drawSession(v); });
+  v.querySelectorAll("[data-qk]").forEach((b) => b.onclick = async () => { const ok = +b.dataset.qk === q.answer; if (ok) sess.quizRight++; const a = { id: uid(), topicId: q.topicId, topic: q.topic, subjectId: q.subjectId, correct: ok, at: Date.now() }; await put("attempts", a); attempts.push(a); $("#seex").innerHTML = `<p class="mut">${esc(q.explain || "")}</p><button class="b" id="seqn">${sess.qi + 1 >= sess.quiz.length ? "Finish" : "Next"}</button>`; $("#seqn").onclick = () => { sess.qi++; drawSession(v); }; });
+}
 
 const views = {
   today(v) {
@@ -386,38 +429,76 @@ const views = {
     const key = dstr(new Date()); const d = plan.days.find((x) => x.date === key);
     const due = dueCards(cards).length;
     const tests = st.subjects.filter((s) => s.testDate).map((s) => { const n = Math.round((parseD(s.testDate) - parseD(key)) / 86400000); return `${esc(s.name)}: ${n < 0 ? "passed" : n === 0 ? "TODAY" : n + " days"}`; });
-    v.innerHTML = `<div class="card"><b>Countdown</b><div class="mut">${tests.join(" | ")}</div></div>${plan.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("")}<div class="card row"><div>Cards due: <b>${due}</b></div><button class="b alt" id="rev">Review cards</button></div><h2 style="margin-bottom:0">Today</h2>${d ? dayHTML(d) : '<div class="card mut">No study days left. Add a future test date in Setup.</div>'}`;
-    $("#rev").onclick = () => { tab = "cards"; render(); }; bindChecks(v);
+    v.innerHTML = `<div class="card"><b>Countdown</b><div class="mut">${tests.join(" | ")}</div></div>${plan.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("")}<div class="card row"><div>Cards due: <b>${due}</b></div><button class="b alt" id="rev">Review cards</button><button class="b" id="focusNow">Start focus</button></div><h2 style="margin-bottom:0">Today</h2>${d ? dayHTML(d) : '<div class="card mut">No study days left. Add a future test date in Setup.</div>'}${carriedHTML()}`;
+    $("#rev").onclick = () => { tab = "cards"; render(); }; $("#focusNow").onclick = () => { tab = "session"; render(); }; bindChecks(v); bindCarried(v);
   },
   plan(v) {
-    v.innerHTML = `<div class="row"><button class="b alt" id="rp">Rebuild plan</button></div>` + plan.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") + plan.days.map((d) => `<h2>${parseD(d.date).toDateString()}</h2>${dayHTML(d)}`).join("");
-    $("#rp").onclick = () => { replan(); render(); }; bindChecks(v);
+    v.innerHTML = `<div class="row"><button class="b alt" id="rp">Rebuild plan</button></div>` + plan.warnings.map((w) => `<div class="warn">${esc(w)}</div>`).join("") + carriedHTML() + plan.days.map((d) => `<h2>${parseD(d.date).toDateString()}</h2>${dayHTML(d)}`).join("");
+    $("#rp").onclick = () => { replan(); render(); }; bindChecks(v); bindCarried(v);
+  },
+
+  session(v) {
+    if (sess) { drawSession(v); return; }
+    const todayKey = dstr(new Date()); const todayBlk = (plan.days.find((x) => x.date === todayKey) || { blocks: [] }).blocks.find((b) => !b.done) || carried.find((b) => !b.unscheduled);
+    v.innerHTML = `<div class="card"><h2>Focus session (offline)</h2><p class="mut">Timer, notes, due cards and a short quiz. Works with no AI and no network.</p>
+    ${st.subjects.length ? `<label>Subject<select id="fesub"><option value="">Any due cards, else next planned</option>${st.subjects.map((s) => `<option value="${s.id}" ${todayBlk && todayBlk.subjectId === s.id ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select></label><div class="row"><label>Minutes<input type="number" id="femin" min="5" step="5" value="${Math.max(5, st.dailyMinutes || 25)}"></label><label>Quiz questions<input type="number" id="fequiz" min="1" max="10" value="3"></label></div>
+    ${todayBlk ? `<div class="mut">Up next: ${esc(todayBlk.subject)} ${esc(todayBlk.label)} ${todayBlk.start} to ${todayBlk.end}</div>` : ""}
+    <button class="b" id="fgo">Start session</button>` : `<div class="mut">Add a subject in Setup first.</div>`}
+    </div>${sessions.length ? `<div class="card"><b>Recent sessions</b>${sessions.slice(-6).reverse().map((s) => `<div class="mut">${new Date(s.started).toLocaleDateString()} ${esc(subName(s.subjectId))} ${s.minutes} min, ${s.cards} cards, quiz ${s.quizRight}/${s.quizN}</div>`).join("")}</div>` : ""}`;
+    if (!st.subjects.length) return;
+    $("#fgo").onclick = () => { startSession($("#fesub").value, todayBlk && $("#fesub").value === todayBlk.subjectId ? todayBlk : null, { minutes: +$("#femin").value || 25, quizN: +$("#fequiz").value || 3 }); render(); };
   },
   library(v) {
     if (!st.subjects.length) { v.innerHTML = `<div class="card">Add a subject in Setup first.</div>`; return; }
-    v.innerHTML = `<div class="card"><h2>Import PDF</h2><select id="sub">${st.subjects.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select><input type="file" id="pdf" accept="application/pdf" multiple><div id="prog" class="mut">PDFs are read in your browser and stored on this device only. Scanned (image) PDFs have no text and cannot be read without AI.</div></div>
-    ${docs.map((d) => `<div class="card"><b>${esc(d.name)}</b> <span class="mut">${esc(subName(d.subjectId))}, ${d.pages} pages, ${d.sections.length} sections</span><div class="mut">${d.sections.slice(0, 6).map((s) => esc(s.title)).join(" | ")}</div><button class="b alt" data-gen="${d.id}">Make cards</button>${ai.ready ? `<button class="b alt" data-aigen="${d.id}">AI cards</button>` : ""}<button class="b bad" data-del="${d.id}">Delete</button></div>`).join("") || '<div class="card mut">No PDFs yet.</div>'}`;
+    const bm = marks.filter((m) => m.kind === "bookmark");
+    v.innerHTML = `<div class="card"><h2>Import PDF</h2><select id="sub">${st.subjects.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select><input type="file" id="pdf" accept="application/pdf" multiple><div id="prog" class="mut">PDFs are read in your browser and stored on this device only. Scanned (image) PDFs have no text and cannot be read without AI. Cloze cards are auto-made too.</div></div>
+    ${bm.length ? `<div class="card"><b>Bookmarks</b>${bm.map((m) => `<div class="row"><span>${esc(m.label)} <span class="mut">${esc(m.page ? "p." + m.page : "")}</span></span><button class="b alt" data-open-guide="${m.sectionId}">Open</button></div>`).join("")}</div>` : ""}
+    ${docs.map((d) => `<div class="card"><b>${esc(d.name)}</b> <span class="mut">${esc(subName(d.subjectId))}, ${d.pages} pages, ${d.sections.length} sections${d.blob ? ", original PDF kept" : ""}</span><div class="mut">${d.sections.slice(0, 6).map((s) => esc(s.title)).join(" | ")}</div><button class="b alt" data-gen="${d.id}">Make cards</button><button class="b alt" data-cloze="${d.id}">Fill-in blanks</button>${ai.ready ? `<button class="b alt" data-aigen="${d.id}">AI cards</button>` : ""}<button class="b alt" data-guide="${d.id}">Study guide</button><button class="b bad" data-del="${d.id}">Delete</button></div>`).join("") || '<div class="card mut">No PDFs yet.</div>'}
+    <div class="card" id="guideCard"><h2>Study guide (searchable text)</h2><div class="row"><input id="gq" placeholder="Search your PDFs for a phrase"><button class="b" id="gsearch">Search</button></div><div id="gout"></div><div id="gsec"></div></div>`;
     $("#pdf").onchange = async (e) => { for (const f of e.target.files) await importPdf(f, $("#sub").value); render(); };
     v.querySelectorAll("[data-gen]").forEach((b) => b.onclick = async () => { const d = docs.find((x) => x.id === b.dataset.gen); const n = await genCards(d); b.textContent = `+${n} cards`; });
+    v.querySelectorAll("[data-cloze]").forEach((b) => b.onclick = async () => { const d = docs.find((x) => x.id === b.dataset.cloze); const have = new Set(cards.map((c) => c.q)); let n = 0; for (const s of d.sections) for (const c of makeClozeCards(s, d.subjectId)) { if (have.has(c.q)) continue; have.add(c.q); await put("cards", c); cards.push(c); n++; } b.textContent = `+${n} blanks`; });
     v.querySelectorAll("[data-aigen]").forEach((b) => b.onclick = async () => { const d = docs.find((x) => x.id === b.dataset.aigen); b.textContent = "working..."; try { const n = await aiCards(d); b.textContent = `+${n} AI cards`; } catch (e) { b.textContent = e.message; } });
+    v.querySelectorAll("[data-guide]").forEach((b) => b.onclick = () => { guideSel = docs.find((x) => x.id === b.dataset.guide).sections[0].id; drawGuide(v); });
+    v.querySelectorAll("[data-open-guide]").forEach((b) => b.onclick = () => { guideSel = b.dataset.openGuide; drawGuide(v); });
+    $("#gsearch").onclick = () => {
+      const q = $("#gq").value; const hits = docSearch(q, allSecs());
+      $("#gout").innerHTML = hits.length ? hits.map(({ section, hits: hs }) => `<div class="card"><div class="row"><div class="mut">${esc(section.title)}${section.page ? ` | p.${section.page}` : ""}</div><button class="b alt" data-gopen="${section.id}">Open section</button></div>${hs.map((h) => `<div class="mut">${esc(h.snippet)}</div>`).join("<hr>")}</div>`).join("") : '<div class="mut">Nothing found.</div>';
+      $("#gout").querySelectorAll("[data-gopen]").forEach((x) => x.onclick = () => { guideSel = x.dataset.gopen; drawGuide(v); });
+    };
+
+    if (guideSel) drawGuide(v);
     v.querySelectorAll("[data-del]").forEach((b) => b.onclick = async () => { if (!confirm("Delete this PDF and its cards?")) return; const d = docs.find((x) => x.id === b.dataset.del); for (const c of cards.filter((c) => d.sections.some((s) => s.id === c.topicId))) await del("cards", c.id); await del("docs", d.id); await load(); render(); });
   },
+
   cards(v) {
-    const due = dueCards(cards);
-    if (!cards.length) { v.innerHTML = `<div class="card">No cards yet. Import a PDF in Library and tap Make cards.</div>`; return; }
-    if (!due.length) { v.innerHTML = `<div class="card">All caught up. ${cards.length} cards total.</div>`; return; }
-    const c = due[0]; let shown = false;
+    const qs = queueStats(cards);
+    v.innerHTML = `<div class="card"><b>Due queue</b><div class="mut">${qs.due} due now, ${qs.overdue} overdue, ${qs.newCards} new, ${qs.future} saved for later. Total ${qs.total} cards.</div><div class="bar"><i style="width:${qs.total ? Math.round((qs.due / qs.total) * 100) : 0}%"></i></div></div>`;
+    const due = dueQueue(cards);
+    if (!cards.length) { v.innerHTML += `<div class="card">No cards yet. Import a PDF in Library and tap Make cards.</div>`; return; }
+    if (!due.length) { v.innerHTML += `<div class="card">All caught up. ${cards.length} cards total.</div>`; return; }
+    const c = due[0]; let shown = false, editing = false;
     const draw = () => {
-      v.innerHTML = `<div class="mut">${due.length} due | ${esc(c.topic)}</div><div class="card"><h2>${esc(c.q)}</h2>${shown ? `<p>${esc(c.a)}</p><div class="row"><button class="b bad" data-q="0">Again</button><button class="b alt" data-q="3">Hard</button><button class="b" data-q="4">Good</button><button class="b alt" data-q="5">Easy</button></div>` : `<button class="b" id="show">Show answer</button>`}</div>`;
-      if (!shown) $("#show").onclick = () => { shown = true; draw(); };
-      else v.querySelectorAll("[data-q]").forEach((b) => b.onclick = async () => { const q = +b.dataset.q; const n = gradeCard(c, q); await put("cards", n); Object.assign(c, n); cards[cards.findIndex((x) => x.id === c.id)] = n; if (q === 0) st.weak[c.topicId] = true; await saveSt(); render(); });
+      v.querySelector("#dueCard")?.remove();
+      const wrap = document.createElement("div");
+      wrap.id = "dueCard";
+      wrap.innerHTML = `<div class="mut">${due.length} due | ${esc(sourceLabel(c))}</div><div class="card"><h2>${esc(c.q)}</h2>${shown ? `<p>${esc(c.a)}</p><div class="row"><button class="b bad" data-q="0">Again</button><button class="b alt" data-q="3">Hard</button><button class="b" data-q="4">Good</button><button class="b alt" data-q="5">Easy</button></div><div class="row"><button class="b alt" id="cedit">Edit card</button><button class="b bad" id="cdel">Delete</button></div>` : `<button class="b" id="show">Show answer</button>`}
+      ${editing ? `<div class="row"><input id="cq" value="${esc(c.q)}"><input id="ca" value="${esc(c.a)}"><button class="b" id="csave">Save</button></div>` : ""}</div>`;
+      v.appendChild(wrap);
+      if (!shown) wrap.querySelector("#show").onclick = () => { shown = true; draw(); };
+      else {
+        wrap.querySelectorAll("[data-q]").forEach((b) => b.onclick = async () => { const q = +b.dataset.q; const n = gradeCard(c, q); await put("cards", n); Object.assign(c, n); cards[cards.findIndex((x) => x.id === c.id)] = n; if (q === 0) st.weak[c.topicId] = true; await saveSt(); render(); });
+        wrap.querySelector("#cedit").onclick = () => { editing = !editing; draw(); };
+        wrap.querySelector("#cdel").onclick = async () => { if (!confirm("Delete this card?")) return; const n = deleteCard(c); await put("cards", n); cards[cards.findIndex((x) => x.id === c.id)] = n; render(); };
+        if (editing) wrap.querySelector("#csave").onclick = async () => { const n = editCard(c, { q: wrap.querySelector("#cq").value, a: wrap.querySelector("#ca").value }); await put("cards", n); cards[cards.findIndex((x) => x.id === c.id)] = n; editing = false; shown = false; draw(); };
+      }
     };
     draw();
   },
   quiz(v) {
-    v.innerHTML = `<div class="card"><h2>Practice test</h2><select id="qs"><option value="">All subjects</option>${st.subjects.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select><select id="qn"><option>5</option><option selected>10</option><option>20</option></select><button class="b" id="start">Start</button>${ai.ready ? '<button class="b alt" id="aiq">AI quiz</button>' : ""}<div id="qerr" class="warn"></div></div><div id="qbox"></div>`;
+    v.innerHTML = `<div class="card"><h2>Practice test</h2><select id="qs"><option value="">All subjects</option>${st.subjects.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select><select id="qn"><option>5</option><option selected>10</option><option>20</option></select><label class="blk"><input type="checkbox" id="qnotes" checked><div class="t">Build some questions from my notes too</div></label><button class="b" id="start">Start</button>${ai.ready ? '<button class="b alt" id="aiq">AI quiz</button>' : ""}<div id="qerr" class="warn"></div></div><div id="qbox"></div>`;
     const pick = () => cards.filter((c) => !$("#qs").value || c.subjectId === $("#qs").value);
-    $("#start").onclick = () => { const q = makeQuiz(pick(), +$("#qn").value); if (q.length < 2) { $("#qerr").textContent = "Not enough cards. Make cards from a PDF first (need several definitions or facts)."; return; } runQuiz(q); };
+    $("#start").onclick = () => { const n = +$("#qn").value; const fromNotes = $("#qnotes").checked ? makeQuizFromNotes(allSecs().filter((x) => !$("#qs").value || x.subjectId === $("#qs").value), Math.max(0, n - 2)) : []; const q = [...makeQuiz(pick(), n), ...fromNotes].slice(0, n); if (q.length < 2) { $("#qerr").textContent = "Not enough cards or note sentences. Make cards from a PDF first."; return; } runQuiz(q); };
     if (ai.ready) $("#aiq").onclick = async () => { const sid = $("#qs").value; const txt = allSecs().filter((s) => !sid || s.subjectId === sid).map((s) => s.text).join("\n").slice(0, 28000); if (!txt) { $("#qerr").textContent = "No PDF text yet."; return; } $("#aiq").textContent = "working..."; try { const j = await callAI({ task: "quiz", text: txt }); runQuiz(j.data.map((x) => ({ id: uid(), topicId: sid || "ai", topic: "AI quiz", subjectId: sid, q: x.q, options: x.options, answer: x.answer, explain: x.explain }))); } catch (e) { $("#qerr").textContent = e.message; } $("#aiq").textContent = "AI quiz"; };
   },
   ask(v) {
@@ -438,7 +519,11 @@ const views = {
     v.innerHTML = `<div class="card"><h2>Subjects and test dates</h2>${st.subjects.map((s) => `<div class="row"><input data-sn="${s.id}" value="${esc(s.name)}"><input type="date" data-sd="${s.id}" value="${s.testDate || ""}"><button class="b bad" data-sx="${s.id}" style="flex:none">x</button></div>`).join("")}<div class="row"><input id="nn" placeholder="New subject"><input type="date" id="nd"><button class="b" id="addS" style="flex:none">Add</button></div></div>
     <div class="card"><h2>Daily time</h2><div class="row"><label>Minutes per day<input type="number" id="dm" min="25" step="5" value="${st.dailyMinutes}"></label><label>From<input type="time" id="ws" value="${st.winStart}"></label><label>Until<input type="time" id="we" value="${st.winEnd}"></label></div><div class="mut">Blocks are ${BLOCK} min with 5 min breaks.</div></div>
     <div class="card"><h2>Busy times</h2>${st.busy.map((b, i) => `<div class="row"><span>${esc(b.label || "Busy")} ${b.start}-${b.end} (${b.days.map((d) => "SMTWTFS"[d]).join("")})</span><button class="b bad" data-bx="${i}" style="flex:none">x</button></div>`).join("")}<input id="bl" placeholder="Activity (school, football...)"><div class="days">${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((n, i) => `<label><input type="checkbox" class="bd" value="${i}">${n}</label>`).join("")}</div><div class="row"><input type="time" id="bs" value="08:00"><input type="time" id="be" value="15:00"><button class="b" id="addB" style="flex:none">Add</button></div></div>
-    <div class="card"><h2>Backup</h2><button class="b" id="exp">Export JSON</button><input type="file" id="imp" accept="application/json"><div class="mut">Includes settings, extracted text, cards and progress. Original PDF files are not included.</div><button class="b bad" id="wipe">Erase all data</button></div>
+    <div class="card"><h2>Check-in for my agent</h2><p class="mut">What did I actually finish, where did I get stuck, and what do I want to try next.</p>
+    <div class="row" id="ckinRow"><button class="b bad" data-ck="in">Missed today</button><button class="b alt" data-ck="bad">Studied badly</button><button class="b" data-ck="good">Did well</button><button class="b alt" data-ck="early">Finished early</button><button class="b alt" data-ck="more">Need more time</button></div>
+    <div id="ckinOut" class="mut"></div>
+    <div class="mut">Saying "missed it" or "studied badly" counts as not-done and the planner carries that block forward. "Did well" marks it done.</div></div>
+    <div class="card"><h2>Backup</h2><div class="${backupStatus({lastExportAt: st.lastExportAt, lastImportAt: st.lastImportAt, docsWithPdf: docs.filter((d) => d.blob).length, docsTotal: docs.length}).tone === "warn" ? "warn" : "mut"}" id="bkStatus">${esc(backupStatus({lastExportAt: st.lastExportAt, lastImportAt: st.lastImportAt, docsWithPdf: docs.filter((d) => d.blob).length, docsTotal: docs.length}).text)}</div><button class="b" id="exp">Export JSON (with original PDFs)</button>${st.lastExportAt || st.snapAt ? '<button class="b alt" id="undo">Undo last import (restore snapshot)</button>' : ""}<input type="file" id="imp" accept="application/json"><div class="mut">Includes settings, extracted text, cards and progress, plus the original PDF files for every doc. Before any import, the app saves a snapshot of your current data so a bad import can be undone.</div><button class="b bad" id="wipe">Erase all data</button></div>
     <div class="card"><h2>AI</h2><div class="mut">${ai.ready ? "Gemini is on (key is set on the server)." : "Off. Add GEMINI_API_KEY in your Vercel project settings (Environment Variables), then redeploy. Never paste it into this app."}</div></div>`;
     const commit = async () => { await saveSt(); replan(); };
     v.querySelectorAll("[data-sn]").forEach((i) => i.onchange = async () => { st.subjects.find((s) => s.id === i.dataset.sn).name = i.value; await commit(); });
@@ -451,12 +536,53 @@ const views = {
     $("#addB").onclick = async () => { const days = [...v.querySelectorAll(".bd:checked")].map((c) => +c.value); if (!days.length || $("#bs").value >= $("#be").value) return alert("Pick days and a valid start/end"); st.busy.push({ label: $("#bl").value, days, start: $("#bs").value, end: $("#be").value }); await commit(); render(); };
     v.querySelectorAll("[data-bx]").forEach((b) => b.onclick = async () => { st.busy.splice(+b.dataset.bx, 1); await commit(); render(); });
     $("#exp").onclick = exportJSON;
+    const u = $("#undo"); if (u) u.onclick = restoreSnapshot;
+    v.querySelectorAll("[data-ck]").forEach((b) => b.onclick = async () => {
+      const k = b.dataset.ck;
+      const todayKey = dstr(new Date());
+      const todayBlk = (plan.days.find((x) => x.date === todayKey) || { blocks: [] }).blocks.find((x) => !x.done) || carried.find((x) => !x.unscheduled);
+      if (!todayBlk) { $("#ckinOut").textContent = "Nothing open to check in for today. See you tomorrow, or finish a Focus session."; return; }
+      if (k === "good") { st.done[todayBlk.id] = true; $("#ckinOut").textContent = "Nice. Marked done."; }
+      if (k === "early" || k === "more") { st.dailyMinutes = Math.max(25, Math.min(240, (st.dailyMinutes || 90) + (k === "more" ? 25 : -25))); $("#ckinOut").textContent = `Daily time is now ${st.dailyMinutes} minutes.`; }
+      if (k === "in" || k === "bad") { $("#ckinOut").textContent = "That block stays undone and will be carried over around your busy times and test dates."; }
+      await saveSt(); replan(); render();
+    });
     $("#imp").onchange = (e) => importJSON(e.target.files[0]);
     $("#wipe").onclick = async () => { if (!confirm("Erase everything on this device?")) return; for (const s of STORES) await clear(s); await load(); render(); };
   },
 };
 
 // ---------- actions ----------
+function drawGuide(v) {
+  const s = secById(guideSel); const box = $("#gsec"); if (!s || !box) return;
+  const doc = docs.find((d) => d.sections.some((x) => x.id === s.id));
+  const highlights = marks.filter((m) => m.kind === "highlight" && m.sectionId === s.id);
+  const bm = marks.find((m) => m.kind === "bookmark" && m.sectionId === s.id);
+  const hls = highlights.reduce((a, m) => a + [m.start, m.end], []).join(", ");
+  box.innerHTML = `<div class="card"><div class="row"><b>${esc(s.title)}</b><span class="mut">From: ${esc(doc ? doc.name : "")}${s.page ? ` | p.${s.page}` : ""}</span></div>
+  <div style="white-space:pre-wrap;line-height:1.6">${hl(s.text)}</div>
+  <div class="row"><button class="b alt" id="ghlsel">Mark selected text</button><button class="b alt" id="gbm">${bm ? "Remove bookmark" : "Bookmark"}</button><button class="b alt" id="gfrom">Make question from this</button></div>
+  <div class="mut">${highlights.length} highlight(s) saved on this device.</div></div>`;
+  function hl(text) {
+    let t = esc(text);
+    for (const m of marks.filter((m) => m.kind === "highlight" && m.sectionId === s.id).sort((a, b) => b.start - a.start)) {
+      const before = t.slice(0, m.start), mid = t.slice(m.start, m.end), after = t.slice(m.end);
+      t = before + `<mark>${mid}</mark>` + after;
+    }
+    return t;
+  }
+  $("#ghlsel").onclick = async () => {
+    const sel = window.getSelection(); const range = sel && sel.getRangeAt && sel.rangeCount ? sel.getRangeAt(0) : null;
+    const txt = sel ? sel.toString().trim() : ""; if (!txt || txt.length < 3) return alert("Select some text in the section first, then tap Mark.");
+    const idx = s.text.indexOf(txt); if (idx < 0) return alert("Could not locate that selection in extracted text.");
+    const m = { id: uid(), kind: "highlight", sectionId: s.id, start: idx, end: idx + txt.length, text: txt, page: s.page, created: Date.now() };
+    await put("marks", m); marks.push(m); drawGuide(v);
+  };
+  $("#gbm").onclick = async () => { if (bm) { await del("marks", bm.id); marks = marks.filter((m) => m.id !== bm.id); } else { const m = { id: uid(), kind: "bookmark", sectionId: s.id, label: s.title, page: s.page, created: Date.now() }; await put("marks", m); marks.push(m); } drawGuide(v); };
+  $("#gfrom").onclick = async () => { const have = new Set(cards.map((c) => c.q)); let n = 0; for (const c of makeClozeCards(s, s.subjectId || (doc && doc.subjectId), 6)) { if (have.has(c.q)) continue; have.add(c.q); await put("cards", c); cards.push(c); n++; } hline(`+${n} fill-in cards in Cards tab`); };
+}
+function hline(t) { const x = $("#gout"); if (x) x.innerHTML = `<div class="warn">${esc(t)}</div>`; }
+
 async function importPdf(file, subjectId) {
   const prog = $("#prog");
   try {
@@ -509,21 +635,49 @@ function shrink(file) {
   return new Promise((res, rej) => { const img = new Image(); img.onload = () => { const s = Math.min(1, 1600 / Math.max(img.width, img.height)); const c = document.createElement("canvas"); c.width = img.width * s; c.height = img.height * s; c.getContext("2d").drawImage(img, 0, 0, c.width, c.height); res(c.toDataURL("image/jpeg", 0.8).split(",")[1]); }; img.onerror = rej; img.src = URL.createObjectURL(file); });
 }
 async function exportJSON() {
-  const out = { app: "study-deck", version: 1, exported: new Date().toISOString(), state: st, docs: docs.map(({ blob, ...d }) => d), cards, attempts };
+  const pdfs = [];
+  for (const d of docs) if (d.blob) pdfs.push({ docId: d.id, name: d.name, mime: d.blob.type || "application/pdf", data: await b64(d.blob) });
+  const out = { app: "study-deck", version: BACKUP_VERSION, exported: new Date().toISOString(), state: st, docs: docs.map(({ blob, ...d }) => d), cards, attempts, sessions, marks, pdfs };
   const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([JSON.stringify(out)], { type: "application/json" })); a.download = `study-deck-${dstr(new Date())}.json`; a.click();
+  st.lastExportAt = Date.now(); await saveSt();
+}
+async function snapshot() {
+  const pdfs = [];
+  for (const d of docs) if (d.blob) pdfs.push({ docId: d.id, name: d.name, mime: d.blob.type || "application/pdf", data: await b64(d.blob) });
+  const snap = { app: "study-deck", version: BACKUP_VERSION, exported: new Date().toISOString(), state: st, docs: docs.map(({ blob, ...d }) => d), cards, attempts, sessions, marks, pdfs };
+  await put("kv", { k: "snapshot", v: snap });
+}
+async function applyBackup(o) {
+  const pdfById = Object.fromEntries((o.pdfs || []).map((p) => [p.docId, p]));
+  for (const s of STORES) await clear(s);
+  st = { ...DEF, ...o.state };
+  await put("kv", { k: "state", v: st });
+  for (const d of o.docs || []) {
+    const p = pdfById[d.id];
+    const nd = p ? { ...d, blob: new Blob([blobFromB64(p.data)], { type: p.mime || "application/pdf" }) } : d;
+    await put("docs", nd);
+  }
+  for (const c of o.cards || []) await put("cards", c);
+  for (const a of o.attempts || []) await put("attempts", a);
+  for (const a of o.sessions || []) await put("sessions", a);
+  for (const a of o.marks || []) await put("marks", a);
+  st.lastImportAt = Date.now(); await saveSt();
 }
 async function importJSON(f) {
   if (!f) return;
   try {
     const o = validateImport(JSON.parse(await f.text()));
-    if (!confirm("This replaces all data on this device. Continue?")) return;
-    for (const s of STORES) await clear(s);
-    await put("kv", { k: "state", v: { ...DEF, ...o.state } });
-    for (const d of o.docs) await put("docs", d);
-    for (const c of o.cards || []) await put("cards", c);
-    for (const a of o.attempts || []) await put("attempts", a);
+    if (!confirm("This replaces all data on this device. A snapshot of your current data is saved first so you can undo. Continue?")) return;
+    await snapshot(); st.snapAt = Date.now(); await saveSt();
+    await applyBackup(o);
     await load(); render();
   } catch (e) { alert("Import failed: " + e.message); }
+}
+async function restoreSnapshot() {
+  const kv = (await all("kv")).find((x) => x.k === "snapshot");
+  if (!kv || !kv.v) return alert("No snapshot saved yet.");
+  if (!confirm("Restore the snapshot from before the last import? Current data will be replaced (and a new snapshot is saved first).")) return;
+  await snapshot(); await applyBackup(kv.v); await load(); render();
 }
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});

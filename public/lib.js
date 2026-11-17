@@ -48,6 +48,7 @@ export function splitSections(pageTexts, maxChars = 3500) {
 
 // ---------- cards and quizzes (no AI) ----------
 export const sentences = (text) => text.replace(/\s+/g, " ").split(/(?<=[.!?])\s+(?=[A-Z0-9"(])/).map((s) => s.trim()).filter((s) => s.length > 30 && s.length < 320);
+const shuffle = (arr, rnd = Math.random) => { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 const STOP = new Set("the a an and or of to in on for with that this these those is are was were be been by as at from it its which who whom their there than then also can may will would should could into such not have has had more most other some any each".split(" "));
 export const keywords = (s) => (s.match(/[A-Za-z][A-Za-z-]{3,}/g) || []).filter((w) => !STOP.has(w.toLowerCase()));
 
@@ -71,7 +72,67 @@ export function makeCards(section, subjectId, max = 12) {
   return cards;
 }
 function newCard(subjectId, section, q, a, kind, ctx) {
-  return { id: uid(), subjectId, topicId: section.id, topic: section.title, q, a, kind, ctx: ctx || a, ease: 2.5, interval: 0, due: 0, reps: 0, lapses: 0 };
+  const src = section.docId || section.docName ? { docId: section.docId || null, docName: section.docName || null, sectionId: section.id, title: section.title, page: section.page || null } : { docId: null, docName: null, sectionId: section.id, title: section.title, page: section.page || null };
+  return { id: uid(), subjectId, topicId: section.id, topic: section.title, q, a, kind, ctx: ctx || a, src, ease: 2.5, interval: 0, due: 0, reps: 0, lapses: 0, created: Date.now(), edited: false, deleted: false };
+}
+
+export function makeCloze(sentence) {
+  const clean = sentence.replace(/\s+/g, " ").trim();
+  const kws = keywords(clean).sort((a, b) => b.length - a.length);
+  const nums = clean.match(/\b\d[\d,.]*\b/);
+  const target = nums && nums[0].length > 1 ? nums[0] : kws[0];
+  if (!target || clean.length <= 45) return null;
+  return { q: clean.replace(target, "_____"), a: target, sentence: clean };
+}
+
+export function makeClozeCards(section, subjectId, max = 12) {
+  const out = [];
+  for (const s of sentences(section.text)) {
+    if (out.length >= max) break;
+    const cz = makeCloze(s);
+    if (cz) out.push(newCard(subjectId, section, cz.q, cz.a, "cloze", cz.sentence));
+  }
+  return out;
+}
+
+export function makeQuizFromNotes(sections, n = 10, rnd = Math.random) {
+  const items = [];
+  for (const sec of sections) {
+    for (const s of sentences(sec.text)) {
+      const cz = makeCloze(s);
+      if (cz) items.push({ ...cz, sec });
+    }
+  }
+  const pool = shuffle(items, rnd).slice(0, n);
+  const answers = [...new Set(items.map((x) => x.a))];
+  const qs = [];
+  for (const it of pool) {
+    const wrong = shuffle(answers.filter((x) => x !== it.a), rnd).slice(0, 3);
+    if (wrong.length < 2) continue;
+    const opts = shuffle([it.a, ...wrong], rnd);
+    qs.push({ id: uid(), topicId: it.sec.id, topic: it.sec.title, subjectId: it.sec.subjectId || null, q: it.q, options: opts, answer: opts.indexOf(it.a), explain: `From your notes (${it.sec.title}): ${it.sentence}` });
+  }
+  return qs;
+}
+
+export function editCard(card, { q, a } = {}) {
+  const c = { ...card, edited: true };
+  if (typeof q === "string" && q.trim()) c.q = q.trim();
+  if (typeof a === "string" && a.trim()) c.a = a.trim();
+  if (c.kind === "cloze" && typeof q === "string" && q.trim()) c.ctx = q.trim();
+  return c;
+}
+
+export function deleteCard(card) { return { ...card, deleted: true }; }
+
+export function dueQueue(cards, now = Date.now()) {
+  return cards.filter((c) => !c.deleted && c.due <= now).sort((x, y) => x.due - y.due || y.lapses - x.lapses || x.id.localeCompare(y.id));
+}
+
+export function queueStats(cards, now = Date.now()) {
+  const live = cards.filter((c) => !c.deleted);
+  const due = live.filter((c) => c.due <= now);
+  return { total: live.length, due: due.length, overdue: due.filter((c) => c.due < now - 86400000).length, newCards: live.filter((c) => c.reps === 0 && c.due <= now).length, learning: live.filter((c) => c.reps > 0 && c.due <= now).length, future: live.length - due.length };
 }
 
 export function gradeCard(card, quality, now = Date.now()) {
@@ -86,9 +147,13 @@ export function gradeCard(card, quality, now = Date.now()) {
   c.ease = Math.max(1.3, c.ease + 0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02));
   return c;
 }
-export const dueCards = (cards, now = Date.now()) => cards.filter((c) => c.due <= now);
+export const dueCards = (cards, now = Date.now()) => dueQueue(cards, now);
 
-const shuffle = (arr, rnd = Math.random) => { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+export function sourceLabel(card) {
+  const s = card && (card.src || {});
+  const bits = [s.docName, s.title, s.page ? `p.${s.page}` : null].filter(Boolean);
+  return bits.length ? `From: ${bits.join(" · ")}` : card && card.topic ? `From: ${card.topic}` : "From: your notes";
+}
 
 export function makeQuiz(cards, n = 10, rnd = Math.random) {
   const cloze = cards.filter((c) => c.kind === "cloze");
@@ -190,7 +255,61 @@ export function buildPlan(st, sectionsBySubject, now = new Date(), prevDone = {}
   return { days, warnings, builtAt: now.toISOString() };
 }
 
-// ---------- search / explain without AI ----------
+// ---------- reschedule missed blocks (adaptive planner) ----------
+export function overlappedByBusy(startMin, endMin, dayDate, st) {
+  const dow = dayDate.getDay();
+  return (st.busy || []).some((b) => b.days.includes(dow) && toMin(b.start) < endMin && toMin(b.end) > startMin);
+}
+export function rescheduleMissed(plannedBlocks, doneMap, st, now = new Date()) {
+  const today = dstr(now);
+  const missed = [];
+  for (const d of plannedBlocks) if (d.date < today) for (const b of d.blocks) if (!doneMap[b.id]) missed.push(b);
+  const taken = new Set();
+  const placed = [];
+  for (const b of missed) {
+    let done = false;
+    for (let off = 1; off <= 14 && !done; off++) {
+      const date = addDays(now, off);
+      const key = dstr(date);
+      const sub = st.subjects.find((s) => s.id === b.subjectId);
+      if (sub && sub.testDate && key > sub.testDate) break;
+      for (const [s, e] of daySlots(date, st, 0)) {
+        const slot = `${key}|${s}`;
+        if (taken.has(slot)) continue;
+        if (overlappedByBusy(s, e, date, st)) continue;
+        taken.add(slot);
+        placed.push({ ...b, id: `${b.id}~${key}`, date: key, start: fromMin(s), end: fromMin(e), carried: true, label: `${b.label} (carried over)` });
+        done = true; break;
+      }
+    }
+    if (!done) placed.push({ ...b, id: `${b.id}~unscheduled`, date: null, unscheduled: true, label: `${b.label} (could not fit: no free window before its test date)` });
+  }
+  return placed;
+}
+
+// ---------- doc search / guide ----------
+export function docSearch(query, sections, perSection = 4) {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  return sections
+    .map((sec) => {
+      const text = sec.text;
+      const lower = text.toLowerCase();
+      const hits = [];
+      let from = 0;
+      while (hits.length < perSection) {
+        const at = lower.indexOf(q, from);
+        if (at < 0) break;
+        const start = Math.max(0, at - 80);
+        const end = Math.min(text.length, at + q.length + 120);
+        hits.push({ start, end, snippet: text.slice(start, end), matchAt: at - start, matchLen: q.length });
+        from = at + q.length;
+      }
+      return hits.length ? { section: sec, hits } : null;
+    })
+    .filter(Boolean);
+}
+export const highlightText = (t, q) => esc(t).replace(new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), (m) => `<mark>${m}</mark>`);
 export function searchSections(query, sections, k = 3) {
   const qk = new Set(keywords(query).map((w) => w.toLowerCase()));
   if (!qk.size) return [];
@@ -203,8 +322,24 @@ export function searchSections(query, sections, k = 3) {
 }
 
 // ---------- export / import ----------
+export const BACKUP_VERSION = 2;
 export function validateImport(obj) {
-  if (!obj || typeof obj !== "object" || obj.app !== "study-deck" || !obj.state || !Array.isArray(obj.docs)) throw new Error("Not a Study Deck backup file");
+  if (!obj || typeof obj !== "object" || obj.app !== "study-deck") throw new Error("Not a Study Deck backup file");
+  if (!obj.state || typeof obj.state !== "object") throw new Error("Backup is missing settings");
+  if (!Array.isArray(obj.docs)) throw new Error("Backup is missing documents");
   if (!Array.isArray(obj.state.subjects)) throw new Error("Backup is missing subjects");
+  const cards = obj.cards || [];
+  if (!Array.isArray(cards)) throw new Error("Backup cards are invalid");
+  if (!cards.every((c) => c && typeof c.q === "string" && typeof c.a === "string")) throw new Error("A card in this backup is missing its question or answer");
+  if (obj.version && obj.version > BACKUP_VERSION) throw new Error("This backup is from a newer app version. Update the app first.");
+  if (obj.version >= 2 && !Array.isArray(obj.pdfs)) throw new Error("Backup has no PDF shelf");
   return obj;
+}
+export function backupStatus({ lastExportAt, lastImportAt, docsWithPdf, docsTotal, pending }) {
+  if (pending) return { tone: "warn", text: "Backup in progress, hold on a moment." };
+  if (!lastExportAt && !lastImportAt) return { tone: "warn", text: `Never backed up on this device yet. ${docsTotal} PDF(s) held locally, ${docsWithPdf} with original file kept.` };
+  const when = Math.max(lastExportAt || 0, lastImportAt || 0);
+  const days = Math.floor((Date.now() - when) / 86400000);
+  const tone = days >= 7 ? "warn" : "ok";
+  return { tone, text: `Last backup ${days === 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`} (${docsWithPdf}/${docsTotal} PDF originals included).` };
 }
