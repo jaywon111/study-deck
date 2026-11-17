@@ -1,10 +1,39 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="en">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Study Deck</title><meta name="theme-color" content="#0f172a">
-<link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg">
-<link rel="apple-touch-icon" href="/icon-192.png"><link rel="stylesheet" href="/style.css"></head>
-<body><header><h1>Study Deck</h1><span id="aiBadge" class="badge">AI: checking</span></header>
+<title>Study Deck — turn PDFs into a study plan</title>
+<meta name="description" content="Local-first study planner. Import PDFs, get a daily plan, flashcards, quizzes and AI explanations. Everything stays on your device.">
+<meta name="theme-color" content="#f7f0de">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="stylesheet" href="/style.css?v=11">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,700;0,9..144,900;1,9..144,700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#" id="brandHome">Study<span>Deck</span></a>
+  <nav class="pillnav" id="topnav" aria-label="Main"></nav>
+  <div class="top-actions">
+    <span id="aiBadge" class="badge">AI: checking</span>
+    <button class="btn ghost" id="ctaSetup">Get started</button>
+  </div>
+</header>
 <main id="view"></main>
-<nav id="nav"></nav>
-<script type="module" src="/app.js"></script></body></html>
+<footer class="footer">
+  <div class="footer-inner">
+    <div class="footer-mark">Study Deck</div>
+    <div class="footer-row">
+      <span>Local first. Your PDFs stay on this device.</span>
+      <span id="footYear"></span>
+    </div>
+  </div>
+</footer>
+<nav id="nav" aria-label="App"></nav>
+<script type="module" src="/app.js?v=11"></script>
+</body>
+</html>

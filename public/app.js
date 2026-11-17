@@ -44,10 +44,291 @@ async function checkAI() {
 }
 
 // ---------- views ----------
-const TABS = [["today", "Today"], ["plan", "Plan"], ["library", "Library"], ["cards", "Cards"], ["quiz", "Quiz"], ["ask", "Ask"], ["progress", "Progress"], ["setup", "Setup"]];
+const TABS = [["today", "Today", "🏠", "Home"], ["plan", "Plan", "🗓️", "Plan"], ["library", "Library", "📚", "Library"], ["cards", "Cards", "🃏", "Cards"], ["quiz", "Quiz", "🧪", "Quiz"], ["ask", "Ask", "💬", "Ask"], ["progress", "Progress", "📈", "Progress"], ["setup", "Setup", "⚙️", "Setup"]];
+
+// The entire nav strip is a 3D rotatable carousel. Each tab is a card
+// on a cylinder; drag to spin, tap a front card to go there.
+const NAV_STEP = 360 / TABS.length;
+// Card size is a plain constant pair (132 desktop / 200 mobile) and is read back
+// from the CSS variable so the cylinder radius always matches the painted cards.
+// Previously a JS vw formula disagreed with the CSS clamp, so on return the front
+// card rendered at the CSS size while the cylinder used the JS size: inconsistent.
+const NAV_CARD = { desktop: 132, mobile: 200 };
+const navCardSize = () => (window.innerWidth || 390) <= 860 ? NAV_CARD.mobile : NAV_CARD.desktop;
+const navRadius = () => {
+  const size = navCardSize();
+  return Math.max(140, Math.min(260, (TABS.length * (size * 0.58)) / Math.tan(Math.PI / TABS.length)));
+};
+const wheel = { angle: 0, target: 0, locked: false, raf: 0, moved: false };
+// expanded is the carousel state. It defaults collapsed on page load so Today
+// does not block scrolling; the Sections toggle expands it. Sizing stays
+// consistent because NAV_CARD and the CSS radius are shared when expanded.
+let expanded = false;
+const norm360 = (n) => ((n % 360) + 360) % 360;
+
+function ensureNavDOM() {
+  const nav = $("#nav");
+  if (!nav || nav.querySelector(".rot")) return nav;
+  nav.classList.add("wheel-nav");
+  nav.innerHTML =
+    '<button type="button" class="wheel-toggle" aria-expanded="' + (expanded ? "true" : "false") + '" aria-controls="rotStage">' +
+    '<span class="wt-label"><span class="wt-title">Sections</span><small class="wt-sub"></small></span>' +
+    '<span class="wt-chev" aria-hidden="true">&#8593;</span></button>' +
+    '<div class="rot-stage" id="rotStage"><div class="rot" role="listbox" aria-label="Study sections" aria-orientation="vertical">' +
+    TABS.map(([k, n, i, label], idx) =>
+      `<button type="button" role="option" class="rot-card" data-t="${k}" data-index="${idx}" aria-label="${n}, ${label}">` +
+      `<span class="rot-num" aria-hidden="true">&#10022;</span><span class="rot-icon" aria-hidden="true">${i}</span><span class="rot-name">${n}</span><span class="rot-sub">${label}</span></button>`
+    ).join("") +
+    '</div></div>' +
+    '<div class="rot-count" aria-hidden="true">eight sections</div>' +
+    '<p class="rot-hint">&#9679; drag to spin &#9679;</p>';
+  bindWheel(nav);
+  syncNavState();
+  return nav;
+}
+
+
+// ---- collapse / expand ----
+function setExpanded(next, focusToggle) {
+  expanded = !!next;
+  syncNavState();
+  if (expanded) {
+    // restore the cylinder at the true angle for the current tab, then render
+    const idx = TABS.findIndex(([k]) => k === tab);
+    if (idx >= 0) { wheel.target = wheel.angle = idx * NAV_STEP; }
+    animateWheel();
+  }
+  if (focusToggle) {
+    const t = $("#nav") && $("#nav").querySelector(".wheel-toggle");
+    if (t) t.focus({ preventScroll: true });
+  }
+}
+function syncNavState() {
+  const navEl = $("#nav");
+  if (!navEl) return;
+  navEl.classList.toggle("collapsed", !expanded);
+  document.body.classList.toggle("nav-collapsed", !expanded);
+  const t = navEl.querySelector(".wheel-toggle");
+  if (t) {
+    t.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const title = t.querySelector(".wt-title");
+    const sub = t.querySelector(".wt-sub");
+    const cur = (TABS.find((x) => x[0] === tab) || TABS[0])[1];
+    if (title) title.textContent = expanded ? "Collapse sections" : "Sections";
+    if (sub) sub.textContent = expanded ? ("drag to spin \u00b7 now on " + cur) : ("tap to expand \u00b7 on " + cur);
+    const stage = navEl.querySelector("#rotStage");
+    if (stage) stage.setAttribute("aria-hidden", expanded ? "false" : "true");
+  }
+}
+
+function renderWheel(angle, instant) {
+  const navEl = $("#nav");
+  const rot = navEl && navEl.querySelector ? navEl.querySelector(".rot") : null;
+  if (!rot) return;
+  rot.style.transform = `translateZ(-${navRadius()}px) rotateX(-14deg) rotateY(${angle}deg)`;
+  const cards = [...rot.querySelectorAll(".rot-card")];
+  cards.forEach((card, idx) => {
+    const face = idx * NAV_STEP;
+    card.style.transform = `rotateY(${face}deg) translateZ(${navRadius()}px)`;
+    const rel = norm360(angle + face);
+    const dist = Math.min(Math.abs(rel), 360 - Math.abs(rel));
+    const front = Math.abs(norm360(angle + face + 180) - 180) < 72; // front half of viewer
+    const frontish = dist < 70;
+    const active = card.dataset.t === tab;
+    card.classList.toggle("front", front && !reducedMotionAny());
+    card.classList.toggle("active", active);
+    card.setAttribute("aria-selected", active ? "true" : "false");
+    // show front and both immediate neighbours (dist <= 90deg), keep click/tap alive there
+    const near = dist <= 90;
+    card.style.visibility = near || active ? "visible" : "hidden";
+    card.style.pointerEvents = near || active ? "auto" : "none";
+    card.style.opacity = front || active ? "1" : "0.35";
+    card.style.filter = front ? "none" : "saturate(.35)";
+  });
+  const c = (navEl && navEl.querySelector) ? navEl.querySelector(".rot-count") : null;
+  if (c) {
+    const idx = TABS.findIndex(([k]) => k === tab);
+    c.textContent = `0${(idx < 0 ? 0 : idx) + 1} / 0${TABS.length}`;
+  }
+}
+function reducedMotionAny() {
+  return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+function animateWheel() {
+  cancelAnimationFrame(wheel.raf);
+  if (reducedMotionAny()) { wheel.angle = wheel.target; renderWheel(wheel.angle, true); return; }
+  const tick = () => {
+    wheel.angle += (wheel.target - wheel.angle) * 0.12;
+    if (Math.abs(wheel.target - wheel.angle) < 0.15) { wheel.angle = wheel.target; renderWheel(wheel.angle); return; }
+    renderWheel(wheel.angle);
+    wheel.raf = requestAnimationFrame(tick);
+  };
+  renderWheel(wheel.angle);
+  wheel.raf = requestAnimationFrame(tick);
+}
+
+function spinToIndex(idx, silent) {
+  const step = NAV_STEP;
+  let delta = norm360(idx * step - wheel.target);
+  if (delta > 180) delta -= 360;
+  wheel.target += delta;
+  if (silent) { wheel.angle = wheel.target; renderWheel(wheel.angle, true); }
+  else animateWheel();
+}
+
+function bindWheel(nav) {
+  const rot = nav.querySelector(".rot");
+  const rotCards = [...rot.querySelectorAll(".rot-card")];
+  const toggle = nav.querySelector(".wheel-toggle");
+  if (toggle) {
+    toggle.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); setExpanded(!expanded); });
+    toggle.addEventListener("pointerdown", (e) => e.stopPropagation());
+  }
+  let dragging = false, startX = 0, startAngle = 0, lastX = 0, lastT = 0, velocity = 0, moved = false, snapping = false;
+  const handle = nav.querySelector(".rot-stage") || rot;
+
+  const onDown = (e) => {
+    if (snapping) return;
+    dragging = true; moved = false;
+    cancelAnimationFrame(wheel.raf);
+    startX = lastX = e.clientX; lastT = performance.now(); startAngle = wheel.target; velocity = 0;
+    try { handle.setPointerCapture?.(e.pointerId); } catch {}
+  };
+  const onMove = (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    if (Math.abs(dx) > 6) moved = true;
+    else return; // require a real horizontal drag before rotating, so tap/click passes through
+    const now = performance.now();
+    const inst = (e.clientX - lastX) / Math.max(1, now - lastT);
+    velocity = 0.8 * velocity + 0.2 * inst;
+    lastX = e.clientX; lastT = now;
+    // natural surface drag: the visible surface follows the finger.
+    // Drag right moves the right-hand item toward the front.
+    // Card faces are placed at +face and rotation is applied as rotateY(angle),
+    // so a positive angle is required for rightward motion.
+    wheel.angle = wheel.target = startAngle + dx * 0.45;
+    renderWheel(wheel.angle);
+  };
+  const onUp = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    if (e && e.pointerId !== undefined) { try { handle.releasePointerCapture?.(e.pointerId); } catch {} }
+    if (!moved) {
+      // tap: if a card was directly hit, navigate there; otherwise keep current
+      const tapped = rotCards.find((c) => c.dataset._tapped);
+      if (tapped && tapped.dataset.t !== tab) {
+        const idx = +tapped.dataset.index;
+        tab = tapped.dataset.t;
+        snapping = true;
+        spinToIndex(idx);
+        render();
+        setTimeout(() => { snapping = false; }, 450);
+      }
+      return;
+    } // dragged: snap + navigate handled below
+    // inertial flick if quick drag: velocity is px per ms, 0.45deg per px
+    const flickDegMs = velocity * 0.45;
+    if (Math.abs(flickDegMs) > 0.22) {
+      // project a bit of extra angle from the throw, then snap
+      const project = Math.max(-NAV_STEP * 1.6, Math.min(NAV_STEP * 1.6, flickDegMs * 220));
+      wheel.target += project;
+    }
+    // snap to the nearest tab and navigate there. Positive angle increments
+    // the index because angle + face = 0 at the front for positive index.
+    const snapped = Math.round(wheel.target / NAV_STEP);
+    const idx = ((snapped % TABS.length) + TABS.length) % TABS.length;
+    snapping = true;
+    spinToIndex(idx);
+    if (TABS[idx] && TABS[idx][0] !== tab) { tab = TABS[idx][0]; render(); }
+    setTimeout(() => { snapping = false; }, 450);
+    setTimeout(() => { moved = false; }, 250);
+  };
+  handle.addEventListener("pointerdown", onDown);
+  handle.addEventListener("pointermove", onMove, { passive: true });
+  handle.addEventListener("pointerup", onUp);
+  handle.addEventListener("pointercancel", onUp);
+  handle.style.touchAction = "pan-y"; // allow vertical page scroll, horizontal drag goes to the wheel
+
+  rotCards.forEach((card) => {
+    const go = () => {
+      if (moved || snapping) return;
+      const idx = +card.dataset.index;
+      if (card.dataset.t !== tab) {
+        tab = card.dataset.t;
+        spinToIndex(idx);
+        render();
+        renderWheel(wheel.angle, true);
+      } else {
+        render();
+      }
+    };
+    card.addEventListener("click", (e) => { e.preventDefault(); go(); });
+    card.addEventListener("pointerdown", (e) => {
+      // direct hit on a card: register tap target; a drag will override in pointerup
+      card.dataset._tapped = "1";
+      setTimeout(() => { delete card.dataset._tapped; }, 600);
+      // do not stopPropagation, so dragging starting on a card also rotates
+    });
+  });
+
+  // drag is the primary control. keyboard: arrows left/right on the stage
+  handle.tabIndex = 0;
+  handle.setAttribute("aria-label", "Drag to rotate sections, or use arrow keys to spin");
+  handle.addEventListener("keydown", (e) => {
+    if (snapping) return;
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      e.preventDefault();
+      if (moved) return;
+      const dir = e.key === "ArrowRight" ? 1 : -1;
+      const cur = TABS.findIndex(([k]) => k === tab);
+      const idx = (cur + dir + TABS.length) % TABS.length;
+      tab = TABS[idx][0];
+      spinToIndex(idx);
+      render();
+      // after render, nav() re-creates DOM; focus the newly selected card
+      const nav2 = $("#nav");
+      nav2 && nav2.querySelector(`.rot-card[data-t="${tab}"]`)?.focus({ preventScroll: true });
+    }
+  });
+  // keep the radius/size in sync with the viewport after rotation/resize
+  window.addEventListener("resize", () => renderWheel(wheel.angle, true));
+}
+
+function initWheel() {
+  const nav = ensureNavDOM();
+  const cur = TABS.findIndex(([k]) => k === tab);
+  const idx = cur < 0 ? 0 : cur;
+  wheel.target = wheel.angle = idx * NAV_STEP;
+  syncNavState();
+  renderWheel(wheel.angle, true);
+  // always render the cylinder so the front card is sized identically on every tab
+  // when collapsed we deliberately leave the cylinder untouched: setting a
+  // rotateY on a hidden stage was the source of the oversized front card on
+  // the first expand after returning to Today.
+}
+
 function nav() {
-  $("#nav").innerHTML = TABS.map(([k, n]) => `<button data-t="${k}" class="${tab === k ? "on" : ""}">${n}</button>`).join("");
-  $("#nav").onclick = (e) => { const t = e.target.closest("button"); if (t) { tab = t.dataset.t; render(); } };
+  // preserve the user's collapsed/expanded choice when switching tabs; initial
+  // load stays collapsed (expanded=false above) and Sections expands it.
+  const navEl = ensureNavDOM();
+  if (navEl && navEl.classList.contains("wheel-nav")) {
+    syncNavState();
+    // sync active state after tab change without rebuilding bindings
+    const idx = TABS.findIndex(([k]) => k === tab);
+    if (idx >= 0 && expanded) {
+      // if angle does not match current tab, spin smoothly
+      const targetAngle = idx * NAV_STEP;
+      if (norm360(wheel.target - targetAngle) !== 0) spinToIndex(idx);
+      else renderWheel(wheel.angle, true);
+    }
+  }
+  const tn = $("#topnav");
+  const pick = (e) => { const t = e.target.closest("button"); if (t) { tab = t.dataset.t; render(); } };
+  if (tn) { tn.innerHTML = TABS.map(([k, n]) => `<button data-t="${k}" class="${tab === k ? "on" : ""}">${n}</button>`).join(""); tn.onclick = pick; }
+  const cta = $("#ctaSetup");
+  if (cta) cta.onclick = () => { tab = "setup"; render(); };
 }
 function render() { nav(); const v = $("#view"); v.innerHTML = ""; (views[tab] || views.today)(v); window.scrollTo(0, 0); }
 const sectionsOf = (blocks) => ["Morning", "Afternoon", "Evening"].map((p) => [p, blocks.filter((b) => b.part === p)]).filter(([, b]) => b.length);
@@ -62,7 +343,46 @@ const dayHTML = (d) => d.blocks.length ? sectionsOf(d.blocks).map(([p, bl]) => `
 
 const views = {
   today(v) {
-    if (!st.subjects.length) { v.innerHTML = `<div class="card"><h2>Welcome</h2><p>Start in Setup: add a subject with its test date, your daily minutes and busy times. Then add a PDF in Library. Everything works offline and stays on this device.</p><button class="b" id="go">Open Setup</button></div>`; $("#go").onclick = () => { tab = "setup"; render(); }; return; }
+    if (!st.subjects.length) { v.innerHTML = `<section class="hero">
+      <p class="eyebrow" style="justify-content:center">Local first study planner</p>
+      <h1>Turn PDFs into a <em>plan</em> that <span class="thin">actually</span> fits your week</h1>
+      <p class="lede">Study Deck reads your PDFs on this device, builds a daily plan around your busy times, and turns notes into flashcards and quizzes. Everything works offline and stays on this device.</p>
+      <div class="hero-cta"><button class="b" id="go">Get started in Setup</button><button class="b alt" id="goLib">How it works</button></div>
+      <div class="fan-wrap"><div class="fan-hint">YOUR STUDY DECK, SPREAD OUT</div><div class="fan" aria-hidden="true">
+        <div class="fcard white f1"><span class="fk">Daily plan</span><span class="ft">Small blocks,<br>every day</span><span class="fs">25 min focus / 5 min break</span></div>
+        <div class="fcard peach f2"><span class="fk">Flashcards</span><span class="ft">Made from<br>your PDFs</span><span class="fs">Spaced repetition built in</span></div>
+        <div class="fcard front"><span class="fk">Study Deck</span><span class="ft">PDFs in.<br>Plan out.</span><span class="fs">Offline &amp; private, on this device</span></div>
+        <div class="fcard ink f3"><span class="fk">Quizzes</span><span class="ft">Practice<br>tests</span><span class="fs">Weak topics surface automatically</span></div>
+        <div class="fcard cream f4"><span class="fk">AI optional</span><span class="ft">Gemini<br>helps</span><span class="fs">Explanations &amp; answer checks</span></div>
+      </div></div>
+      <div class="stats">
+        <div class="stat"><b>25<i>min</i></b><span>focused blocks, 5 min breaks</span></div>
+        <div class="stat"><b>100<i>%</i></b><span>offline, on-device storage</span></div>
+        <div class="stat"><b>PDF</b><span>import in Library</span></div>
+        <div class="stat"><b>AI</b><span>optional Gemini help</span></div>
+      </div>
+    </section>
+    <section class="section"><div class="sec-head center"><p class="eyebrow" style="justify-content:center">How it works</p><h2>Three moves, then the plan runs itself</h2></div>
+      <div class="layer-stack">
+        <div class="lcard"><span class="l-tag t-butter">Set up</span><div><h3>Subjects first</h3><p>Add a subject with its test date, your daily minutes and busy times in Setup.</p></div><div class="pill-arrow">&#8594;</div></div>
+        <div class="lcard"><span class="l-tag t-cobalt">Drop in</span><div><h3>Then a PDF</h3><p>Drop a PDF in Library. Text is extracted in your browser and stored on this device only.</p></div><div class="pill-arrow">&#8594;</div></div>
+        <div class="lcard"><span class="l-tag t-vermilion">Plan out</span><div><h3>Then study the plan</h3><p>Short Learn, Practice and Review blocks, with a practice test on the last day. Tick them off as you go.</p></div><div class="pill-arrow">&#8594;</div></div>
+      </div>
+    </section>
+    <section class="section"><div class="sec-head"><p class="eyebrow">What you get</p><h2>Built for exam season</h2></div>
+      <div class="svc-rows">
+        <div class="svc"><span class="mono m-cobalt" aria-hidden="true">P</span><div><h3>Daily plan</h3><p>Blocks scheduled around your busy times, not over them.</p></div><div class="pill-arrow">&#8594;</div></div>
+        <div class="svc"><span class="mono m-butter" aria-hidden="true">R</span><div><h3>Flashcards &amp; quizzes</h3><p>Auto-made from your PDFs with spaced repetition. Weak topics surface in Progress.</p></div><div class="pill-arrow">&#8594;</div></div>
+        <div class="svc"><span class="mono m-vermilion" aria-hidden="true">A</span><div><h3>Ask &amp; AI help</h3><p>Search your notes, or turn on Gemini for explanations and answer checking.</p></div><div class="pill-arrow">&#8594;</div></div>
+      </div>
+    </section>
+    <section class="section"><div class="accent-panel"><p class="eyebrow">Why it stays local</p><h2>Your PDFs never leave this device</h2><p class="mut">No uploads, no account, no cloud copy. IndexedDB stores everything in this browser, on this phone or laptop, and keeps working in airplane mode.</p>
+      <div class="accent-grid">
+        <div class="accent-tile"><b>0</b><span>PDFs uploaded anywhere</span></div>
+        <div class="accent-tile"><b>100%</b><span>of data stored on-device</span></div>
+        <div class="accent-tile"><b>JSON</b><span>backup you can export anytime</span></div>
+      </div></div>
+    </section>`; $("#go").onclick = () => { tab = "setup"; render(); }; $("#goLib").onclick = () => { tab = "library"; render(); }; return; }
     const key = dstr(new Date()); const d = plan.days.find((x) => x.date === key);
     const due = dueCards(cards).length;
     const tests = st.subjects.filter((s) => s.testDate).map((s) => { const n = Math.round((parseD(s.testDate) - parseD(key)) / 86400000); return `${esc(s.name)}: ${n < 0 ? "passed" : n === 0 ? "TODAY" : n + " days"}`; });
@@ -208,4 +528,4 @@ async function importJSON(f) {
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-load().then(() => { render(); checkAI(); });
+load().then(() => { const fy = $("#footYear"); if (fy) fy.textContent = "\u00a9 " + new Date().getFullYear() + " Study Deck. Local first."; initWheel(); render(); checkAI(); });
