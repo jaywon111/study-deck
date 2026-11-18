@@ -451,12 +451,12 @@ const views = {
   library(v) {
     if (!st.subjects.length) { v.innerHTML = `<div class="card">Add a subject in Setup first.</div>`; return; }
     const bm = marks.filter((m) => m.kind === "bookmark");
-    v.innerHTML = `<div class="card"><h2>Import PDF</h2><select id="sub">${st.subjects.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select><div class="row"><label class="b" for="pdf">Choose PDF</label><label class="b alt" for="pdfm">Choose several</label></div><input type="file" id="pdf" style="position:absolute;opacity:0;width:1px;height:1px"><input type="file" id="pdfm" multiple style="position:absolute;opacity:0;width:1px;height:1px"><div id="prog" class="mut">PDFs are read in your browser and stored on this device only. Scanned (image) PDFs have no text and cannot be read without AI. Cloze cards are auto-made too.</div></div>
+    v.innerHTML = `<div class="card"><h2>Import PDF</h2><select id="sub">${st.subjects.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select><div class="row"><label class="b" for="pdf">Choose PDF</label><label class="b alt" for="pdfm">Choose several</label><label class="b alt" for="pdff">Choose (PDF filter)</label></div><input type="file" id="pdf" style="position:absolute;opacity:0;width:1px;height:1px"><input type="file" id="pdff" accept="application/pdf,.pdf" style="position:absolute;opacity:0;width:1px;height:1px"><input type="file" id="pdfm" multiple style="position:absolute;opacity:0;width:1px;height:1px"><div class="mut">Drive picker greyed out? Open the PDF in the Google Drive app, tap Share (or Open in), pick Study Deck. It lands in your first subject. Needs the app installed to the home screen.</div><div id="prog" class="mut">PDFs are read in your browser and stored on this device only. Scanned (image) PDFs have no text and cannot be read without AI. Cloze cards are auto-made too.</div></div>
     ${bm.length ? `<div class="card"><b>Bookmarks</b>${bm.map((m) => `<div class="row"><span>${esc(m.label)} <span class="mut">${esc(m.page ? "p." + m.page : "")}</span></span><button class="b alt" data-open-guide="${m.sectionId}">Open</button></div>`).join("")}</div>` : ""}
     ${docs.map((d) => `<div class="card"><b>${esc(d.name)}</b> <span class="mut">${esc(subName(d.subjectId))}, ${d.pages} pages, ${d.sections.length} sections${d.blob ? ", original PDF kept" : ""}</span><div class="mut">${d.sections.slice(0, 6).map((s) => esc(s.title)).join(" | ")}</div><button class="b alt" data-gen="${d.id}">Make cards</button><button class="b alt" data-cloze="${d.id}">Fill-in blanks</button>${ai.ready ? `<button class="b alt" data-aigen="${d.id}">AI cards</button>` : ""}<button class="b alt" data-guide="${d.id}">Study guide</button><button class="b bad" data-del="${d.id}">Delete</button></div>`).join("") || '<div class="card mut">No PDFs yet.</div>'}
     <div class="card" id="guideCard"><h2>Study guide (searchable text)</h2><div class="row"><input id="gq" placeholder="Search your PDFs for a phrase"><button class="b" id="gsearch">Search</button></div><div id="gout"></div><div id="gsec"></div></div>`;
     const onPick = async (e) => { const fs = Array.from(e.target.files || []); const sub = $("#sub").value; e.target.value = ""; for (const f of fs) await importPdf(f, sub); render(); };
-    $("#pdf").onchange = onPick; $("#pdfm").onchange = onPick;
+    $("#pdf").onchange = onPick; $("#pdfm").onchange = onPick; $("#pdff").onchange = onPick;
     v.querySelectorAll("[data-gen]").forEach((b) => b.onclick = async () => { const d = docs.find((x) => x.id === b.dataset.gen); const n = await genCards(d); b.textContent = `+${n} cards`; });
     v.querySelectorAll("[data-cloze]").forEach((b) => b.onclick = async () => { const d = docs.find((x) => x.id === b.dataset.cloze); const have = new Set(cards.map((c) => c.q)); let n = 0; for (const s of d.sections) for (const c of makeClozeCards(s, d.subjectId)) { if (have.has(c.q)) continue; have.add(c.q); await put("cards", c); cards.push(c); n++; } b.textContent = `+${n} blanks`; });
     v.querySelectorAll("[data-aigen]").forEach((b) => b.onclick = async () => { const d = docs.find((x) => x.id === b.dataset.aigen); b.textContent = "working..."; try { const n = await aiCards(d); b.textContent = `+${n} AI cards`; } catch (e) { b.textContent = e.message; } });
@@ -685,4 +685,15 @@ async function restoreSnapshot() {
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-load().then(() => { const fy = $("#footYear"); if (fy) fy.textContent = "\u00a9 " + new Date().getFullYear() + " Study Deck. Local first."; initWheel(); render(); checkAI(); });
+async function takeShared() {
+  if (!/[?&]shared=1/.test(location.search)) return;
+  history.replaceState(null, "", "/");
+  try {
+    const c = await caches.open("sd-share"); const ks = await c.keys(); if (!ks.length) return;
+    if (!st.subjects.length) { tab = "setup"; render(); alert("PDF received. Add a subject in Setup, then share it again."); return; }
+    tab = "library"; render();
+    for (const k of ks) { const r = await c.match(k); const b = await r.blob(); const name = decodeURIComponent(k.url.split("/").pop()); await importPdf(new File([b], name, { type: "application/pdf" }), st.subjects[0].id); await c.delete(k); }
+    render();
+  } catch (e) { alert("Shared PDF import failed: " + e.message); }
+}
+load().then(() => { const fy = $("#footYear"); if (fy) fy.textContent = "\u00a9 " + new Date().getFullYear() + " Study Deck. Local first."; initWheel(); render(); checkAI(); takeShared(); });
