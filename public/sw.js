@@ -1,4 +1,4 @@
-const V="sd-v12";const CORE=["/","/index.html","/style.css","/app.js","/lib.js","/manifest.webmanifest","/icon.svg","/icon-192.png","/icon-512.png","/vendor/pdf.min.mjs","/vendor/pdf.worker.min.mjs"];
+const V="sd-v13";const CORE=["/","/index.html","/style.css","/app.js","/lib.js","/manifest.webmanifest","/icon.svg","/icon-192.png","/icon-512.png","/vendor/pdf.min.mjs","/vendor/pdf.worker.min.mjs"];
 self.addEventListener("install",e=>{e.waitUntil(caches.open(V).then(c=>c.addAll(CORE)).then(()=>self.skipWaiting()))});
 self.addEventListener("activate",e=>{e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==V).map(x=>caches.delete(x)))).then(()=>self.clients.claim()))});
 self.addEventListener("fetch",e=>{const u=new URL(e.request.url);

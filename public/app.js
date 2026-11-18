@@ -526,7 +526,7 @@ const views = {
     <div class="row" id="ckinRow"><button class="b bad" data-ck="in">Missed today</button><button class="b alt" data-ck="bad">Studied badly</button><button class="b" data-ck="good">Did well</button><button class="b alt" data-ck="early">Finished early</button><button class="b alt" data-ck="more">Need more time</button></div>
     <div id="ckinOut" class="mut"></div>
     <div class="mut">Saying "missed it" or "studied badly" counts as not-done and the planner carries that block forward. "Did well" marks it done.</div></div>
-    <div class="card"><h2>Backup</h2><div class="${backupStatus({lastExportAt: st.lastExportAt, lastImportAt: st.lastImportAt, docsWithPdf: docs.filter((d) => d.blob).length, docsTotal: docs.length}).tone === "warn" ? "warn" : "mut"}" id="bkStatus">${esc(backupStatus({lastExportAt: st.lastExportAt, lastImportAt: st.lastImportAt, docsWithPdf: docs.filter((d) => d.blob).length, docsTotal: docs.length}).text)}</div><button class="b" id="exp">Export JSON (with original PDFs)</button>${st.lastExportAt || st.snapAt ? '<button class="b alt" id="undo">Undo last import (restore snapshot)</button>' : ""}<input type="file" id="imp" accept="application/json"><div class="mut">Includes settings, extracted text, cards and progress, plus the original PDF files for every doc. Before any import, the app saves a snapshot of your current data so a bad import can be undone.</div><button class="b bad" id="wipe">Erase all data</button></div>
+    <div class="card"><h2>Backup</h2><div class="${backupStatus({lastExportAt: st.lastExportAt, lastImportAt: st.lastImportAt, docsWithPdf: docs.filter((d) => d.blob).length, docsTotal: docs.length}).tone === "warn" ? "warn" : "mut"}" id="bkStatus">${esc(backupStatus({lastExportAt: st.lastExportAt, lastImportAt: st.lastImportAt, docsWithPdf: docs.filter((d) => d.blob).length, docsTotal: docs.length}).text)}</div><button class="b" id="exp">Export JSON (with original PDFs)</button>${st.lastExportAt || st.snapAt ? '<button class="b alt" id="undo">Undo last import (restore snapshot)</button>' : ""}<input type="file" id="imp" accept="application/json,.json"><div class="mut" id="impStatus">Backup restore takes a Study Deck .json file. A PDF picked here is added to your Library instead.</div><div class="mut">Includes settings, extracted text, cards and progress, plus the original PDF files for every doc. Before any import, the app saves a snapshot of your current data so a bad import can be undone.</div><button class="b bad" id="wipe">Erase all data</button></div>
     <div class="card"><h2>AI</h2><div class="mut">${ai.ready ? "Gemini is on (key is set on the server)." : "Off. Add GEMINI_API_KEY in your Vercel project settings (Environment Variables), then redeploy. Never paste it into this app."}</div></div>`;
     const commit = async () => { await saveSt(); replan(); };
     v.querySelectorAll("[data-sn]").forEach((i) => i.onchange = async () => { st.subjects.find((s) => s.id === i.dataset.sn).name = i.value; await commit(); });
@@ -550,7 +550,7 @@ const views = {
       if (k === "in" || k === "bad") { $("#ckinOut").textContent = "That block stays undone and will be carried over around your busy times and test dates."; }
       await saveSt(); replan(); render();
     });
-    $("#imp").onchange = (e) => importJSON(e.target.files[0]);
+    $("#imp").onchange = (e) => importJSON(e.target.files[0], e.target);
     $("#wipe").onclick = async () => { if (!confirm("Erase everything on this device?")) return; for (const s of STORES) await clear(s); await load(); render(); };
   },
 };
@@ -586,8 +586,9 @@ function drawGuide(v) {
 }
 function hline(t) { const x = $("#gout"); if (x) x.innerHTML = `<div class="warn">${esc(t)}</div>`; }
 
+function isPdfBytes(buf) { const h = new Uint8Array(buf.slice(0, 1024)); for (let i = 0; i + 4 <= h.length; i++) if (h[i] === 37 && h[i+1] === 80 && h[i+2] === 68 && h[i+3] === 70) return true; return false; }
 async function importPdf(file, subjectId) {
-  const prog = $("#prog");
+  const prog = $("#prog") || $("#impStatus") || { textContent: "" };
   try {
     prog.textContent = `Reading ${file.name}...`;
     const pdfjs = await import("/vendor/pdf.min.mjs");
@@ -605,8 +606,12 @@ async function importPdf(file, subjectId) {
     const sections = splitSections(pages);
     if (!sections.length) { prog.textContent = `${file.name}: no readable text (scanned PDF?).`; alert("No text found. This looks like a scanned PDF."); return; }
     const doc = { id: uid(), subjectId, name: file.name, pages: pdf.numPages, sections, blob: new Blob([buf], { type: "application/pdf" }), added: Date.now() };
-    await put("docs", doc); docs.push(doc);
+    await put("docs", doc);
+    const saved = (await all("docs")).find((x) => x.id === doc.id);
+    if (!saved || !saved.blob) throw new Error("saved copy could not be read back from this browser's storage (private mode or storage full?)");
+    docs.push(doc);
     await genCards(doc); replan();
+    prog.textContent = `${file.name}: saved on this device (${pdf.numPages} pages, ${sections.length} sections).`;
   } catch (e) { prog.textContent = "Failed: " + e.message; alert("Could not read PDF: " + e.message); }
 }
 async function genCards(doc) {
@@ -668,15 +673,28 @@ async function applyBackup(o) {
   for (const a of o.marks || []) await put("marks", a);
   st.lastImportAt = Date.now(); await saveSt();
 }
-async function importJSON(f) {
+async function importJSON(f, inputEl) {
   if (!f) return;
+  const status = (t) => { const x = $("#impStatus"); if (x) x.textContent = t; };
   try {
-    const o = validateImport(JSON.parse(await f.text()));
+    const buf = await f.arrayBuffer();
+    if (isPdfBytes(buf)) {
+      // A PDF picked in the backup box: store it as a document instead of trying to parse it as JSON.
+      if (!st.subjects.length) { status(`${f.name} is a PDF, not a backup. Add a subject in Setup first, then pick it again. Nothing was changed.`); alert(`${f.name} is a PDF, not a backup. Add a subject in Setup first, then pick it again. Nothing was changed.`); return; }
+      status(`${f.name} is a PDF, so it is being added to your Library (first subject), not restored as a backup.`);
+      await importPdf(new File([buf], f.name, { type: "application/pdf" }), st.subjects[0].id);
+      render();
+      return;
+    }
+    let raw; try { raw = new TextDecoder("utf-8").decode(buf); } catch { raw = ""; }
+    let parsed; try { parsed = JSON.parse(raw); } catch { throw new Error(`${f.name} is not a Study Deck backup (.json). To add a PDF use Library > Choose PDF. Nothing was changed.`); }
+    const o = validateImport(parsed);
     if (!confirm("This replaces all data on this device. A snapshot of your current data is saved first so you can undo. Continue?")) return;
     await snapshot(); st.snapAt = Date.now(); await saveSt();
     await applyBackup(o);
     await load(); render();
-  } catch (e) { alert("Import failed: " + e.message); }
+  } catch (e) { status("Import failed: " + e.message); alert("Import failed: " + e.message); }
+  finally { try { if (inputEl) inputEl.value = ""; } catch {} }
 }
 async function restoreSnapshot() {
   const kv = (await all("kv")).find((x) => x.k === "snapshot");
